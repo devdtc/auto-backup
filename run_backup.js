@@ -241,6 +241,7 @@ async function processArchivesP(archives, secret, forceBackupArchives, tmpDir) {
       }
     }
 
+    // FIXME: would it be better to do the upload before delete to avoid data loss?
     if (backupRemotePaths.length === 0) {
       console.log(`No remotes require backup, exiting`);
       return
@@ -251,6 +252,8 @@ async function processArchivesP(archives, secret, forceBackupArchives, tmpDir) {
     let { filePath, nonce, size } = await createBackupP(contents, secret, compress, tmpDir);
     debug(`Backup of archive ${aspec.name} at ${filePath}: size=${size}b, nonce=${nonce.toString('hex')}`);
     let createTime = moment();
+
+    // FIXME: if uploading to one remote fails, they probably shouldn't all fail
 
     // bracket this to ensure backup is cleaned up with finally()
     await (async () => {
