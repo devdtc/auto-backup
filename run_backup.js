@@ -262,7 +262,7 @@ async function processArchivesP(archives, secret, forceBackupArchives, tmpDir) {
     })()
       .finally(() => {
         debug(`Deleting temp archive at ${filePath}`);
-        // return fs.promises.unlink(filePath);
+        return fs.promises.unlink(filePath);
       });
   }
 }
