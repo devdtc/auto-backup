@@ -141,8 +141,8 @@ function getBackupsToRetain(backups, schedule) {
 }
 
 function getBackupsToDelete(backups, schedule) {
-  let retainIds = new Set(getBackupsToRetain(backups, schedule).map(({ ID }) => ID));
-  return backups.filter(({ ID }) => !retainIds.has(ID));
+  let retainIds = getBackupsToRetain(backups, schedule).map(({ ID }) => ID);
+  return backups.filter(({ ID }) => !retainIds.includes(ID));
 }
 
 function getShouldBackup(backups, schedule) {
@@ -183,7 +183,7 @@ async function createBackupP(contents, secret, compress, tmpDir) {
     new PassThrough().on('data', chunk => size += chunk.length),
     output
   );
-  return { path: tmpFile, nonce, size };
+  return { filePath: tmpFile, nonce, size };
 }
 
 async function getContentsP(cspec) {
@@ -207,15 +207,15 @@ async function getContentsP(cspec) {
   return contents;
 }
 
-async function uploadBackupP(remotePath, archivePrefix, filePath, tags) {
-  let dateSuffix = moment().format('YYYYMMDDHHmmss');
+async function uploadBackupP(remotePath, archivePrefix, filePath, createTime, tags) {
+  let dateSuffix = createTime.format('YYYYMMDDHHmmss');
   let tagsSuffix = Object.entries(tags).map(([tag, value]) => `${tag}=${value}`).join('-');
   let archiveName = `${archivePrefix}-${dateSuffix}-${tagsSuffix}.tar.gz.dat`;
 
   await checkRunCommandP('rclone', ['copyto', filePath, path.join(remotePath, archiveName)]);
 }
 
-async function processArchivesP(archives, secret, tmpDir) {
+async function processArchivesP(archives, secret, forceBackupArchives, tmpDir) {
   for (let aspec of archives) {
     let archivePrefix = getArchivePrefix(aspec.name);
     let compress = aspec.compress !== false; // compress if true or null
@@ -235,32 +235,34 @@ async function processArchivesP(archives, secret, tmpDir) {
         await checkRunCommandP('rclone', ['deletefile', path.join(remotePath, Name)]);
       }
 
-      if (getShouldBackup(backups, rspec.schedule)) {
+      if (getShouldBackup(backups, rspec.schedule) || forceBackupArchives.includes(aspec.name)) {
         debug(`Backup needed for ${remotePath}`);
         backupRemotePaths.push(remotePath);
       }
     }
 
     if (backupRemotePaths.length === 0) {
-      console.log(`No remotes require backup, exiting...`);
+      console.log(`No remotes require backup, exiting`);
       return
     }
     debug(`Backups required at remotes: ${backupRemotePaths.join(', ')}`);
 
     let contents = await getContentsP(aspec.contents);
-    let { path, nonce, size } = await createBackupP(contents, secret, compress, tmpDir);
-    debug(`Backup of archive ${aspec.name} created at ${path}: size=${size}b, nonce=${nonce.toString('hex')}`);
+    let { filePath, nonce, size } = await createBackupP(contents, secret, compress, tmpDir);
+    debug(`Backup of archive ${aspec.name} at ${filePath}: size=${size}b, nonce=${nonce.toString('hex')}`);
+    let createTime = moment();
 
     // bracket this to ensure backup is cleaned up with finally()
     await (async () => {
       for (let remotePath of backupRemotePaths) {
         console.log(`Uploading backup of archive ${aspec.name} to ${remotePath}`);
-        await uploadBackupP(remotePath, archivePrefix, path, { nonce: nonce.toString('hex') });
+        // We pass in the create time so the same archive on different remotes has the same file name.
+        await uploadBackupP(remotePath, archivePrefix, filePath, createTime, { nonce: nonce.toString('hex') });
       }
     })()
       .finally(() => {
-        debug(`Deleting temp archive at ${path}`);
-        // return fs.promises.unlink(path);
+        debug(`Deleting temp archive at ${filePath}`);
+        // return fs.promises.unlink(filePath);
       });
   }
 }
@@ -270,16 +272,24 @@ return (async () => {
   let args =
     require('yargs')
       .option('archives', {
+        desc: 'Path to archive descriptor json file',
         demandOption: true,
         type: 'string'
       })
       .options('secret', {
+        desc: 'Path to encryption key file',
         demandOption: true,
         type: 'string'
       })
       .option('tmp', {
+        desc: 'Directory to store temporary files',
         demandOption: true,
         type: 'string'
+      })
+      .option('force', {
+        desc: 'Creates a backup for the given archives even if they are not scheduled for one',
+        default: [],
+        type: 'array'
       })
       .option('debug', {
         default: false,
@@ -292,7 +302,7 @@ return (async () => {
 
   debug.enabled = args.debug;
 
-  processArchivesP(archives, secret, args.tmp);
+  processArchivesP(archives, secret, args.force, args.tmp);
 
   console.log('Done');
 })();
