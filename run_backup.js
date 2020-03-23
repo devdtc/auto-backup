@@ -7,7 +7,7 @@ const fs = require('fs');
 const glob = require('glob');
 const moment = require('moment');
 const path = require('path');
-const { Writable, Transform, pipeline } = require('stream');
+const { PassThrough, Transform, Writable, pipeline } = require('stream');
 const tar = require('tar-stream');
 const { promisify } = require('util');
 const zlib = require('zlib');
@@ -66,17 +66,15 @@ async function runCommandP(cmd, args) {
   });
 }
 
-// Checks rcode === 0.
+// Rejects if rcode === 0.
 async function checkRunCommandP(cmd, args) {
   debug(`Running command '${cmd} ${args.join(' ')}'`);
 
-  return runCommandP(cmd, args)
-    .then(result => {
-      if (result.rcode !== 0) {
-        throw new Error(`Command '${cmd} ${args.join(' ')}' failed with rcode=${result.rcode}: ${result.stderr}`);
-      }
-      return result;
-    });
+  let result = await runCommandP(cmd, args);
+  if (result.rcode !== 0) {
+    throw new Error(`Command '${cmd} ${args.join(' ')}' failed with rcode=${result.rcode}: ${result.stderr}`);
+  }
+  return result;
 }
 
 async function runJsonCommandP(cmd, args) {
@@ -104,6 +102,7 @@ function sortBackupsByModTime(backups) {
   return backups.sort(({ ModTime: a }, { ModTime: b }) => b.diff(a));
 }
 
+// Replaces duration specs with moment.duration.
 function parseSchedule(schedule) {
   return schedule.map(({ every, for: _for }) => ({
     every: every ? moment.duration(every) : null,
@@ -158,7 +157,7 @@ function getShouldBackup(backups, schedule) {
   return sortedBackups.length === 0 || moment().subtract(minInterval).isAfter(sortedBackups[0].ModTime);
 }
 
-// Note: secret is assumed to have been generated with sufficient entropy. No additional entry (except the iv) is created here.
+// Note: secret is assumed to have been generated with sufficient entropy. No additional entropy (except the iv) is added here.
 // To decrypt: openssl enc -in <file> -out /dev/stdout -d -aes-256-cbc -iv <nonce> -K `sha256sum <secret file>  | cut -d' ' -f1` | tar -xzvf -
 async function createBackupP(contents, secret, compress, tmpDir) {
   let tmpFile = path.join(tmpDir, crypto.randomBytes(32).toString('hex'));
@@ -174,45 +173,38 @@ async function createBackupP(contents, secret, compress, tmpDir) {
   let key = crypto.createHash('sha256').update(secret).digest();
 
   let size = 0;
+
   await pipelineP(
     archive,
     zlib.createGzip({
       level: compress ? zlib.constants.Z_BEST_COMPRESSION : zlib.constants.Z_NO_COMPRESSION,
     }),
     crypto.createCipheriv('aes-256-cbc', key, nonce),
-    new Transform({
-      transform(chunk, encoding, callback) {
-        size += chunk.length;
-        callback(null, chunk);
-      }
-    }),
+    new PassThrough().on('data', chunk => size += chunk.length),
     output
   );
   return { path: tmpFile, nonce, size };
 }
 
 async function getContentsP(cspec) {
-  let contents = await Promise.all(
-    cspec.map(async ({ base, filePattern, mountBase }) => {
-      filePattern = filePattern || '';
-      mountBase = mountBase || '';
+  let contents = [];
+  for (let { base, filePattern, mountBase } of cspec) {
+    filePattern = filePattern || '';
+    mountBase = mountBase || '';
 
-      let matches = await promisify(glob)(
-        path.join(base, filePattern),
-        { realpath: true, nodir: true }
-      );
+    let matches = await promisify(glob)(
+      path.join(base, filePattern),
+      { realpath: true, nodir: true }
+    );
 
-      let ret = [];
-      for (let match of matches) {
-        ret.push({
-          path: match,
-          mountPath: path.join(mountBase, path.relative(base, match))
-        });
-      }
-      return ret;
-    })
-  );
-  return contents.flat();
+    contents.push(
+      ...matches.map(match => ({
+        path: match,
+        mountPath: path.join(mountBase, path.relative(base, match))
+      }))
+    );
+  }
+  return contents;
 }
 
 async function uploadBackupP(remotePath, archivePrefix, filePath, tags) {
@@ -301,4 +293,6 @@ return (async () => {
   debug.enabled = args.debug;
 
   processArchivesP(archives, secret, args.tmp);
+
+  console.log('Done');
 })();
