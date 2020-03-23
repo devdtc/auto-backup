@@ -68,7 +68,7 @@ async function runCommandP(cmd, args) {
 
 // Checks rcode === 0.
 async function checkRunCommandP(cmd, args) {
-  console.log(`Running command '${cmd} ${args.join(' ')}'`);
+  debug(`Running command '${cmd} ${args.join(' ')}'`);
 
   return runCommandP(cmd, args)
     .then(result => {
@@ -89,8 +89,7 @@ function getRemotePath(remote, path) {
 }
 
 function getArchivePrefix(name) {
-  // return `archive-${name}`;
-  return name;
+  return `archive-${name}`;
 }
 
 async function getBackupsP(remotePath, archivePrefix) {
@@ -174,7 +173,7 @@ async function createBackupP(contents, secret, compress, tmpDir) {
   let nonce = await promisify(crypto.randomBytes)(16);
   let key = crypto.createHash('sha256').update(secret).digest();
 
-  let hash = crypto.createHash('md5');
+  let size = 0;
   await pipelineP(
     archive,
     zlib.createGzip({
@@ -183,13 +182,13 @@ async function createBackupP(contents, secret, compress, tmpDir) {
     crypto.createCipheriv('aes-256-cbc', key, nonce),
     new Transform({
       transform(chunk, encoding, callback) {
-        hash.update(chunk);
+        size += chunk.length;
         callback(null, chunk);
       }
     }),
     output
   );
-  return { path: tmpFile, md5: hash.digest('hex'), nonce };
+  return { path: tmpFile, nonce, size };
 }
 
 async function getContentsP(cspec) {
@@ -221,8 +220,6 @@ async function uploadBackupP(remotePath, archivePrefix, filePath, tags) {
   let tagsSuffix = Object.entries(tags).map(([tag, value]) => `${tag}=${value}`).join('-');
   let archiveName = `${archivePrefix}-${dateSuffix}-${tagsSuffix}.tar.gz.dat`;
 
-  console.log(`Uploading ${archiveName} to ${remotePath}`);
-
   await checkRunCommandP('rclone', ['copyto', filePath, path.join(remotePath, archiveName)]);
 }
 
@@ -247,7 +244,7 @@ async function processArchivesP(archives, secret, tmpDir) {
       }
 
       if (getShouldBackup(backups, rspec.schedule)) {
-        debug(`Backup needed for remote ${rspec.name}`);
+        debug(`Backup needed for ${remotePath}`);
         backupRemotePaths.push(remotePath);
       }
     }
@@ -256,26 +253,23 @@ async function processArchivesP(archives, secret, tmpDir) {
       console.log(`No remotes require backup, exiting...`);
       return
     }
+    debug(`Backups required at remotes: ${backupRemotePaths.join(', ')}`);
 
     let contents = await getContentsP(aspec.contents);
-    let { path, md5, nonce } = await createBackupP(contents, secret, compress, tmpDir);
+    let { path, nonce, size } = await createBackupP(contents, secret, compress, tmpDir);
+    debug(`Backup of archive ${aspec.name} created at ${path}: size=${size}b, nonce=${nonce.toString('hex')}`);
 
-    console.log(path, md5, nonce.toString('hex'));
-
-    for (let remotePath of backupRemotePaths) {
-      await Promise.resolve()
-        .then(() => {
-          let backupSameHash = backups.find(({ Hashes }) => Hashes.MD5 === md5);
-          if (!backupSameHash) {
-            return uploadBackupP(remotePath, archivePrefix, path, { nonce: nonce.toString('hex') });
-          }
-          console.log(`There is already a backup with the same contents for ${aspec.name} from ${backupSameHash.ModTime.toString()}`);
-        })
-        .finally(() => {
-          console.log(`Deleting temp archive at ${path}`);
-          // return fs.promises.unlink(path);
-        });
-    }
+    // bracket this to ensure backup is cleaned up with finally()
+    await (async () => {
+      for (let remotePath of backupRemotePaths) {
+        console.log(`Uploading backup of archive ${aspec.name} to ${remotePath}`);
+        await uploadBackupP(remotePath, archivePrefix, path, { nonce: nonce.toString('hex') });
+      }
+    })()
+      .finally(() => {
+        debug(`Deleting temp archive at ${path}`);
+        // return fs.promises.unlink(path);
+      });
   }
 }
 
@@ -297,7 +291,7 @@ return (async () => {
       })
       .option('debug', {
         default: false,
-        type: 'bool'
+        type: 'boolean'
       })
       .strict(true)
       .argv;
