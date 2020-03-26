@@ -46,31 +46,39 @@ debug.enabled = false;
 
 let pipelineP = promisify(pipeline);
 
-async function runCommandP(cmd, args) {
-  return new Promise((resolve, reject) => {
-    let outbuf = new BufferStream();
-    let errbuf = new BufferStream();
+function runCommand(cmd, args) {
+  let proc = spawn(cmd, args);
 
-    let proc = spawn(cmd, args);
-    proc.stdout.pipe(outbuf);
-    proc.stderr.pipe(errbuf);
-    // Note that both error and exit may be called, but calling resolve/reject more than once is a noop.
-    proc.on('error', reject);
-    proc.on('exit', rcode => {
-      resolve({
-        rcode,
-        stdout: outbuf.get().toString(),
-        stderr: errbuf.get().toString(),
-      });
-    });
-  });
+  return {
+    stdin: proc.stdin,
+    stdout: proc.stdout,
+    stderr: proc.stderr,
+    promise: new Promise((resolve, reject) => {
+      // Note that both error and exit may be called, but calling resolve/reject more than once is a noop.
+      proc.on('error', reject);
+      proc.on('exit', resolve);
+    })
+  };
+}
+
+async function runSimpleCommandP(cmd, args) {
+  let { stdout, stderr, promise } = runCommand(cmd, args);
+  let outbuf = stdout.pipe(new BufferStream());
+  let errbuf = stderr.pipe(new BufferStream());
+  let rcode = await promise;
+
+  return {
+    rcode,
+    stdout: outbuf.get().toString(),
+    stderr: errbuf.get().toString()
+  };
 }
 
 // Rejects if rcode === 0.
-async function checkRunCommandP(cmd, args) {
+async function checkRunSimpleCommandP(cmd, args) {
   debug(`Running command '${cmd} ${args.join(' ')}'`);
 
-  let result = await runCommandP(cmd, args);
+  let result = await runSimpleCommandP(cmd, args);
   if (result.rcode !== 0) {
     throw new Error(`Command '${cmd} ${args.join(' ')}' failed with rcode=${result.rcode}: ${result.stderr}`);
   }
@@ -78,7 +86,7 @@ async function checkRunCommandP(cmd, args) {
 }
 
 async function runJsonCommandP(cmd, args) {
-  let { stdout } = await checkRunCommandP(cmd, args);
+  let { stdout } = await checkRunSimpleCommandP(cmd, args);
   return JSON.parse(stdout);
 }
 
@@ -157,9 +165,7 @@ function getShouldBackup(backups, schedule) {
   return sortedBackups.length === 0 || moment().subtract(minInterval).isAfter(sortedBackups[0].ModTime);
 }
 
-// Note: secret is assumed to have been generated with sufficient entropy. No additional entropy (except the iv) is added here.
-// To decrypt: openssl enc -in <file> -out /dev/stdout -d -aes-256-cbc -iv <nonce> -K `sha256sum <secret file>  | cut -d' ' -f1` | tar -xzvf -
-async function createBackupP(contents, secret, compress, tmpDir) {
+async function createBackupP(contents, secretPath, compress, tmpDir) {
   let tmpFile = path.join(tmpDir, crypto.randomBytes(32).toString('hex'));
   let output = fs.createWriteStream(tmpFile);
 
@@ -169,21 +175,33 @@ async function createBackupP(contents, secret, compress, tmpDir) {
   }
   archive.finalize();
 
-  let nonce = await promisify(crypto.randomBytes)(16);
-  let key = crypto.createHash('sha256').update(secret).digest();
-
+  // stream to gpg so we don't have to go to disk
+  // FIXME: error handling here isn't robust; when I add an invalid flag it crashes on gzip emit
+  let { stdin: gpgIn, stdout: gpgOut, stderr: gpgErr, promise: gpgRcodeP } =
+      runCommand('gpg', ['--symmetric', '--pinentry-mode', 'loopback', '--passphrase-file', secretPath]);
+  let gpgErrBuf = gpgErr.pipe(new BufferStream());
   let size = 0;
 
-  await pipelineP(
-    archive,
-    zlib.createGzip({
-      level: compress ? zlib.constants.Z_BEST_COMPRESSION : zlib.constants.Z_NO_COMPRESSION,
-    }),
-    crypto.createCipheriv('aes-256-cbc', key, nonce),
-    new PassThrough().on('data', chunk => size += chunk.length),
-    output
-  );
-  return { filePath: tmpFile, nonce, size };
+  await Promise.all([
+    pipelineP(
+      archive,
+      zlib.createGzip({
+        level: compress ? zlib.constants.Z_BEST_COMPRESSION : zlib.constants.Z_NO_COMPRESSION,
+      }),
+      gpgIn
+    ),
+    pipelineP(
+      gpgOut,
+      new PassThrough().on('data', chunk => size += chunk.length),
+      output
+    )
+  ]);
+  let gpgRcode = await gpgRcodeP;
+  if (gpgRcode !== 0) {
+    throw new Error(`GPG encryption failed with rcode=${gpgRcode}: ${gpgErrBuf.get().toString()}`);
+  }
+
+  return { filePath: tmpFile, size };
 }
 
 async function getContentsP(cspec) {
@@ -209,13 +227,14 @@ async function getContentsP(cspec) {
 
 async function uploadBackupP(remotePath, archivePrefix, filePath, createTime, tags) {
   let dateSuffix = createTime.format('YYYYMMDDHHmmss');
-  let tagsSuffix = Object.entries(tags).map(([tag, value]) => `${tag}=${value}`).join('-');
-  let archiveName = `${archivePrefix}-${dateSuffix}-${tagsSuffix}.tar.gz.dat`;
+  let tagsSuffix = Object.entries(tags || {}).map(([tag, value]) => `${tag}=${value}`).join('-');
+  tagsSuffix = tagsSuffix ? `-${tagsSuffix}` : '';
+  let archiveName = `${archivePrefix}-${dateSuffix}${tagsSuffix}.tar.gz.gpg`;
 
-  await checkRunCommandP('rclone', ['copyto', filePath, path.join(remotePath, archiveName)]);
+  await checkRunSimpleCommandP('rclone', ['copyto', filePath, path.join(remotePath, archiveName)]);
 }
 
-async function processArchivesP(archives, secret, forceBackupArchives, tmpDir) {
+async function processArchivesP(archives, secretPath, forceBackupArchives, tmpDir) {
   for (let aspec of archives) {
     let archivePrefix = getArchivePrefix(aspec.name);
     let compress = aspec.compress !== false; // compress if true or null
@@ -232,7 +251,7 @@ async function processArchivesP(archives, secret, forceBackupArchives, tmpDir) {
       console.log(`Deleting ${backupsToDelete.length} backup(s) of archive ${aspec.name} at ${remotePath}`);
       debug('Deleting backups: ', backupsToDelete);
       for (let { Name } of backupsToDelete) {
-        await checkRunCommandP('rclone', ['deletefile', path.join(remotePath, Name)]);
+        await checkRunSimpleCommandP('rclone', ['deletefile', path.join(remotePath, Name)]);
       }
 
       if (getShouldBackup(backups, rspec.schedule) || forceBackupArchives.includes(aspec.name)) {
@@ -249,8 +268,8 @@ async function processArchivesP(archives, secret, forceBackupArchives, tmpDir) {
     debug(`Backups required at remotes: ${backupRemotePaths.join(', ')}`);
 
     let contents = await getContentsP(aspec.contents);
-    let { filePath, nonce, size } = await createBackupP(contents, secret, compress, tmpDir);
-    debug(`Backup of archive ${aspec.name} at ${filePath}: size=${size}b, nonce=${nonce.toString('hex')}`);
+    let { filePath, size } = await createBackupP(contents, secretPath, compress, tmpDir);
+    debug(`Backup of archive ${aspec.name} at ${filePath}: size=${size}b`);
     let createTime = moment();
 
     // FIXME: if uploading to one remote fails, they probably shouldn't all fail
@@ -260,7 +279,7 @@ async function processArchivesP(archives, secret, forceBackupArchives, tmpDir) {
       for (let remotePath of backupRemotePaths) {
         console.log(`Uploading backup of archive ${aspec.name} to ${remotePath}`);
         // We pass in the create time so the same archive on different remotes has the same file name.
-        await uploadBackupP(remotePath, archivePrefix, filePath, createTime, { nonce: nonce.toString('hex') });
+        await uploadBackupP(remotePath, archivePrefix, filePath, createTime);
       }
     })()
       .finally(() => {
@@ -275,12 +294,12 @@ return (async () => {
   let args =
     require('yargs')
       .option('archives', {
-        desc: 'Path to archive descriptor json file',
+        desc: 'Path to the archive descriptor file',
         demandOption: true,
         type: 'string'
       })
       .options('secret', {
-        desc: 'Path to encryption key file',
+        desc: 'Path to the encryption key file',
         demandOption: true,
         type: 'string'
       })
@@ -301,11 +320,10 @@ return (async () => {
       .strict(true)
       .argv;
   let archives = JSON.parse(await fs.promises.readFile(args.archives, { encoding: 'utf8' }));
-  let secret = await fs.promises.readFile(args.secret, { encoding: 'utf8' });
 
   debug.enabled = args.debug;
 
-  processArchivesP(archives, secret, args.force, args.tmp);
+  processArchivesP(archives, args.secret, args.force, args.tmp);
 
   console.log('Done');
 })();
