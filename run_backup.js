@@ -323,7 +323,7 @@ return (async () => {
 
   debug.enabled = args.debug;
 
-  processArchivesP(archives, args.secret, args.force, args.tmp);
+  await processArchivesP(archives, args.secret, args.force, args.tmp);
 
   console.log('Done');
 })();
